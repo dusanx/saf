@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import sys
+import argparse
+import tempfile
+import subprocess
+import configparser
+from enum import Enum
+from pathlib import Path
+from datetime import datetime, timedelta
+
+def errquit(*args):
+    for ln in args: print(ln, file=sys.stderr)
+    sys.exit(1)
+
+# used to enumerate fancy print modes
+class Mode(Enum):
+    idle = 0
+    hourly = 1
+    daily = 2
+    weekly = 3
+    monthly = 4
+    yearly = 5
+
+# dot.notation access to dictionary attributes
+class dotdict(dict):
+    __getattr__ = dict.get
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
+# main class
+class saf:
+    saf_version         = '0.15'
+    saf_verbose_level   = 1
+
+    ###################
+    # Utility functions
+    ###################
+
+    def safely_execute(self, cmd, return_output = False, output_on_screen = False, stop_on_error = True):
+        # uses bash to straighten up shell diferences
+        final_cmd = ['bash', '-c']
+        final_cmd.append(' '.join(cmd))
+        if self.saf_verbose_level >= 2: print(f'Executing:\n{final_cmd}')
+        # determine if we should catch output or not
+        capture = False
+        if return_output: capture = True
+        if self.saf_verbose_level <= 1 and not output_on_screen: capture = True
+        # determine if output should reach screen
+        on_screen = False
+        if output_on_screen and capture: on_screen = True
+        # run
+        try:
+            if capture:
+                res = subprocess.run(final_cmd, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, text = True)
+            else:
+                res = subprocess.run(final_cmd)
+        except Exception as e:
+            errquit(f'Error executing {cmd}, exception {e}')
+        if stop_on_error and res.returncode != 0:
+            errquit(f'Error executing {cmd}')
+        if on_screen:
+            print(res.stdout)
+        return res
+
+    def split_server_location(self, location):
+        # split and return [location, server], server is optional
+        loc = location.split(':')
+        if len(loc) == 1:
+            ret = [loc[0], None]
+        else:
+            ret = [loc[1], loc[0]]
+        if ret[0].endswith('/'): ret[0] = ret[0][:-1]
+        return ret
+
+    def get_backup_folders(self, target):
+        # gather all backup folders
+        if target.needs_ssh:
+            cmd_prefix = f'ssh -q {target.ssh_options} {target.ssh_server} '
+        else:
+            cmd_prefix = ''
+        cmd = cmd_prefix + f'"ls" -1 "{target.path}"'
+        res = self.safely_execute([cmd], return_output=True)
+        # filter what looks like backup
+        pattern = re.compile('^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]$') #2023-08-04-233001
+        backup_list = [x for x in res.stdout.split('\n') if pattern.match(x)]
+        backup_list.sort()
+        return backup_list
+
+    def marker_check(self, target):
+        # safely contruct command
+        if target.needs_ssh:
+            cmd_prefix = f'ssh -q {target.ssh_options} {target.ssh_server} '
+        else:
+            cmd_prefix = ''
+        cmd = cmd_prefix + f'"ls" -1 "{target.path}/backup.marker"'
+        res = self.safely_execute([cmd], return_output=True, stop_on_error=False)
+        line = res.stdout.split('\n')[0]
+        if res.returncode != 0 or not line == f'{target.path}/backup.marker':
+            errquit(f'Safety check failed - the destination does not appear to be a backup directory or drive (marker file not found)',
+                    f'If it is indeed a backup directory, you may add the marker file by running the following commands:',
+                    f'',
+                    f'    {cmd_prefix}mkdir -p -- "{target.path}"',
+                    f'    {cmd_prefix}touch "{target.path}/backup.marker"'
+                    )
+
+    def conf_or_err(self):
+        # find first conf or err
+        dir = Path.cwd().resolve()
+        found = False
+        while True:
+            conf = dir / '.saf.conf'
+            if conf.is_file():
+                found = True
+                break
+            if dir == Path('/'):
+                break
+            dir = dir.parent.resolve()
+        if not found:
+            errquit('Not a saf backup source (or any of the parent directories): .saf.conf not found')
+        return conf
+
+    def backup_target_or_err(self, conf, want_target):
+        c = configparser.ConfigParser(allow_no_value=True)
+        c.read(str(conf))
+        # take first target or want_target
+        target_name = None
+        for s in c.sections():
+            if want_target is None and s.endswith('.target'):
+                target_name = s
+                break
+            if s == f'{want_target}.target':
+                target_name = f'{want_target}.target'
+                break
+        if target_name is None:
+            if want_target is None:
+                errquit(f'{conf} does not have any backup target defined')
+            else:
+                errquit(f'{conf} does not have backup target named {want_target}')
+        # sort out and return target
+        target = dotdict({})
+        target.name = target_name
+        target.source_location = c['source']['location']
+        target.exclude = [item[0] for item in c.items('exclude')]
+        target.full_path = c[target_name].get('location', None)
+        if target.full_path is None:
+            errquit(f'{conf} does not have location specified in {target_name}')
+        if target.full_path.endswith('/'): target.full_path = target.full_path[:-1]
+        split = self.split_server_location(target.full_path)
+        target.ssh_server = split[1]
+        target.path = split[0]
+        target.needs_ssh = split[1] is not None
+        target.keep_hourly = c[target_name].getint('keep-hourly', 2)
+        target.keep_daily = c[target_name].getint('keep-daily', 30)
+        target.keep_weekly = c[target_name].getint('keep-weekly', 60)
+        target.keep_monthly = c[target_name].getint('keep-monthly', 730)
+        target.keep_yearly = c[target_name].getint('keep-yearly', 3650)
+        target.rsync_options = c[target_name].get('rsync-options', '')
+        target.ssh_options = c[target_name].get('ssh-options', '')
+        return target
+
+    ##############
+    # Command line
+    ##############
+
+    def process_command_line(self):
+        def add_verbose_options(p):
+            p_verbose = p.add_mutually_exclusive_group()
+            p_verbose.add_argument('--quiet', '-q', action='store_true', help='be very quiet')
+            p_verbose.add_argument('--verbose', '-v', type=int, choices=range(0, 3), help='set verbose level 0..2 (default=1)')
+            p_verbose.add_argument('--debug', '-d', action='store_true', help='be more verbose')
+        parser = argparse.ArgumentParser()
+        subcommands = parser.add_subparsers(help='sub-command', required=True)
+        # saf version
+        p_version = subcommands.add_parser('version', help='show saf version')
+        p_version.set_defaults(cmd='version')
+        # saf init
+        p_init = subcommands.add_parser('init', help='initialize new backup source')
+        p_init.set_defaults(cmd='init')
+        p_init.add_argument('--name', '-n', metavar='NAME', help='set or add backup target name to the existing configuration')
+        p_init.add_argument('target', help='local (/path) or remote (server:/path) location')
+        # saf status
+        p_status = subcommands.add_parser('status', help='query backup status for the location')
+        p_status.set_defaults(cmd='status')
+        p_status_reach = p_status.add_mutually_exclusive_group()
+        p_status_reach.add_argument('--all', '-a', action='store_true', help='find all the saf backup locations for current directory')
+        p_status_reach.add_argument('--reverse', '-r', action='store_true', help='find saf backup locations in any sub-directory')
+        # saf configedit
+        p_configedit = subcommands.add_parser('configedit', help='edit closest .saf.conf, responsible for this location')
+        p_configedit.set_defaults(cmd='configedit')
+        add_verbose_options(p_configedit)
+        # saf list
+        p_list = subcommands.add_parser('list', help='list backups at target location')
+        p_list.set_defaults(cmd='list')
+        add_verbose_options(p_list)
+        p_list.add_argument('name', nargs='?', default=None, help='list specific backup target destination')
+        # saf realsizes
+        p_realsizes = subcommands.add_parser('realsizes', help='show content size on backup destination')
+        p_realsizes.set_defaults(cmd='realsizes')
+        add_verbose_options(p_realsizes)
+        p_realsizes.add_argument('name', nargs='?', default=None, help='list specific backup target destination')
+        # saf freespace
+        p_freespace = subcommands.add_parser('freespace', help='show free space on backup target destination')
+        p_freespace.set_defaults(cmd='freespace')
+        add_verbose_options(p_freespace)
+        p_freespace.add_argument('name', nargs='?', default=None, help='list specific backup target destination')
+        # saf prune
+        p_prune = subcommands.add_parser('prune', help='prune backups on target destination')
+        p_prune.set_defaults(cmd='prune')
+        add_verbose_options(p_prune)
+        p_prune.add_argument('name', nargs='?', default=None, help='prune specific backup target destination')
+        # saf backup
+        p_backup = subcommands.add_parser('backup', help='run backup')
+        p_backup.set_defaults(cmd='backup')
+        add_verbose_options(p_backup)
+        p_backup.add_argument('--resume', '-r', action='store_true', help='resume backup if partial backup exists, or start new if not (without this switch start new backup always)')
+        p_backup.add_argument('name', nargs='?', default=None, help='backup specific backup target destination')
+        # saf rmrf
+        p_rmrf = subcommands.add_parser('rmrf', help='run rmrf to remove same file/folder in all backups')
+        p_rmrf.set_defaults(cmd='rmrf')
+        add_verbose_options(p_rmrf)
+        p_rmrf.add_argument('name', nargs='?', default=None, help='rmrf on specific backup target destination')
+        p_rmrf.add_argument('path', help='what to rmrf')
+        # saf difference
+        p_difference = subcommands.add_parser('difference', help='compare any backup with previous')
+        p_difference.set_defaults(cmd='difference')
+        add_verbose_options(p_difference)
+        p_difference.add_argument('name', nargs='?', default=None, help='difference on specific backup target destination')
+        p_difference.add_argument('backup', help='what to difference (must be backup folder YYYY-MM-DD-HHMMSS)')
+        # parse and process
+        args = parser.parse_args()
+        # verbose
+        if 'verbose' in args:
+            if args.verbose is not None:
+                self.saf_verbose_level = args.verbose
+            elif args.quiet:
+                self.saf_verbose_level = 0
+            elif args.debug:
+                self.saf_verbose_level = 2
+        # run command
+        match args.cmd:
+            case 'version':
+                self.run_version(args)
+            case 'init':
+                self.run_init(args)
+            case 'status':
+                self.run_status(args)
+            case 'configedit':
+                self.run_configedit(args)
+            case 'list':
+                self.run_list(args)
+            case 'realsizes':
+                self.run_realsizes(args)
+            case 'freespace':
+                self.run_freespace(args)
+            case 'prune':
+                self.run_prune(args)
+            case 'backup':
+                self.run_backup(args)
+            case 'rmrf':
+                self.run_rmrf(args)
+            case 'difference':
+                self.run_difference(args)
+            case _:
+                print('command not found?')
+
+    ##########
+    # Commands
+    ##########
+
+    def run_version(self, args):
+        print(f'saf {self.saf_version}')
+
+    def run_init(self, args):
+        # prepare
+        loc = self.split_server_location(args.target)
+        local_template = loc[1] is None
+        target_name = args.name if args.name is not None else 'B0'
+        dir = Path.cwd().resolve()
+        conf_file = dir / '.saf.conf'
+        config_list = []
+        add_section = f'{target_name}.target'
+        # read or create conf file
+        if conf_file.is_file():
+            # can we add target_name?
+            c = configparser.ConfigParser(allow_no_value=True)
+            c.read(str(conf_file))
+            if c.has_section(add_section):
+                errquit(f'Backup target "{target_name}" already exists, please use',
+                        f'    saf configedit',
+                        f'or',
+                        f'    saf init --name',
+                        f'to change or specify different target name.'
+                        )
+            with open(conf_file, 'r') as f:
+                config_list = f.read().splitlines()
+        else:
+            config_list.append('# Moving .saf.conf to another location or changing')
+            config_list.append('# [source] location= is usually a bad idea.')
+            config_list.append('')
+            config_list.append('[source]')
+            config_list.append('')
+            config_list.append(f"location = {dir}")
+            config_list.append('')
+            config_list.append('# [exclude] section follows rsync syntax:')
+            config_list.append('# Exclude, "-", specifies an exclude pattern. Include, "+", specifies an include pattern.')
+            config_list.append('# "- *.o" would exclude all names matching *.o')
+            config_list.append('# "- /foo" would exclude a file (or directory) named foo in the transfer-root directory')
+            config_list.append('# "- foo/" would exclude any directory named foo')
+            config_list.append('# "- /foo/*/bar" would exclude any file named bar which is at two levels below a directory named foo in the transfer-root directory')
+            config_list.append('# "- /foo/**/bar" would exclude any file named bar two or more levels below a directory named foo in the transfer-rootdirectory')
+            config_list.append('')
+            config_list.append('[exclude]')
+            config_list.append('')
+            config_list.append('- *.iso')
+            config_list.append('- *.tmp')
+            config_list.append('')
+            config_list.append('# If there is more than one, first target location in the list')
+            config_list.append('# will be default target location. Order of target locations can')
+            config_list.append('# be changed without consequences, to determine which target to')
+            config_list.append('# use as a default.')
+        # add new backup target
+        config_list.append('')
+        config_list.append(f'[{add_section}]')
+        config_list.append('')
+        config_list.append(f'location = {args.target}')
+        config_list.append('keep-hourly = 2')      # keep all hourly backups for two days
+        config_list.append('keep-daily = 30')      # keep all daily backups for about a month
+        config_list.append('keep-weekly = 60')     # keep all weekly backups for about two months
+        config_list.append('keep-monthly = 730')   # keep all monthly backup for about two years
+        config_list.append('keep-yearly = 3650')   # keep all yearly backup for about ten years
+        config_list.append('rsync-options = -D --compress --numeric-ids --links --hard-links --one-file-system --itemize-changes --times --recursive --perms --owner --group')
+        if local_template:
+            config_list.append('ssh-options =')
+        else:
+            config_list.append('ssh-options = -p 22')
+        # save
+        with open(conf_file, 'w') as f:
+            f.writelines([s + '\n' for s in config_list])
+        print(f'Initialized .saf.conf in {dir}, with backup target location {target_name}.')
+        print(f'You can edit manually or use "saf configedit" before first use.')
+
+    def run_status(self, args):
+        def conf_details(conf):
+            print('')
+            c = configparser.ConfigParser(allow_no_value=True)
+            c.read(str(conf))
+            print(f'Source: {str(conf)} ==>')
+            for s in c.sections():
+                if not s.endswith('.target'):
+                    continue
+                target_name = s.replace('.target', '')
+                target_location = c[s]['location']
+                print(f'  ==> {target_name} ==> {target_location}')
+        dir = Path.cwd().resolve()
+        if args.reverse:
+            print(f'Searching for all backup source locations starting from current directory ({dir}). Please wait.')
+            for conf in dir.rglob('.saf.conf'):
+                conf_details(conf)
+        else:
+            if args.all:
+                print(f'Searching for all backup source locations that cover current directory ({dir}).')
+            else:
+                print(f'Searching for first backup source location that covers current directory ({dir}).')
+            found = False
+            while True:
+                conf = dir / '.saf.conf'
+                if conf.is_file():
+                    conf_details(conf)
+                    found = True
+                    if not args.all:
+                        break
+                if dir == Path('/'):
+                    break
+                dir = dir.parent.resolve()
+            if not found:
+                errquit('', 'Not a saf backup source (or any of the parent directories): .saf.conf not found')
+
+    def run_configedit(self, args):
+        # must have $EDITOR
+        ed = os.getenv('EDITOR')
+        if ed is None:
+            errquit('Shell environment variable $EDITOR is not defined.')
+        # find first responsible or err
+        dir = Path.cwd().resolve()
+        found = False
+        while True:
+            conf = dir / '.saf.conf'
+            if conf.is_file():
+                found = True
+                break
+            if dir == Path('/'):
+                break
+            dir = dir.parent.resolve()
+        if not found:
+            errquit('Not a saf backup source (or any of the parent directories): .saf.conf not found')
+        # edit
+        self.safely_execute([ed, str(conf)])
+
+    def run_list(self, args):
+        # must be part of at least one backup source
+        conf = self.conf_or_err()
+        # load specific conf backup target or err
+        target = self.backup_target_or_err(conf, args.name)
+        # make sure that destination exists
+        self.marker_check(target)
+        # some output
+        if self.saf_verbose_level > 0:
+            print(f'List of backups in {conf}, [{target.name.replace(".target", "")}] ==> {target.full_path}')
+            print('')
+        # gather all backup folders
+        backup_list = self.get_backup_folders(target)
+        # print list with time difference
+        now = datetime.now()
+        maxl = len(str(len(backup_list)))
+        mode = Mode.idle
+        cut_hourly  = now - timedelta(days = target.keep_hourly)
+        cut_daily   = now - timedelta(days = target.keep_daily)
+        cut_weekly  = now - timedelta(days = target.keep_weekly)
+        cut_monthly = now - timedelta(days = target.keep_monthly)
+        cut_yearly  = now - timedelta(days = target.keep_yearly)
+        for idx, backup_folder in enumerate(backup_list):
+            backup_date = datetime.strptime(backup_folder, '%Y-%m-%d-%H%M%S')
+            backup_diff = now - backup_date
+            new_mode = mode
+            if backup_date >= cut_monthly: new_mode = Mode.monthly
+            if backup_date >= cut_weekly:  new_mode = Mode.weekly
+            if backup_date >= cut_daily:   new_mode = Mode.daily
+            if backup_date >= cut_hourly:  new_mode = Mode.hourly
+            if mode != new_mode:
+                print('---- keep ' + str(new_mode).replace('Mode.', '') + ' ------------------------------------')
+                mode = new_mode
+            print('%*d/%*d' % (maxl, idx+1, maxl, len(backup_list)), end='    ')
+            print (backup_folder, end="   ")
+            # print time difference depending on mode
+            match mode:
+                case Mode.hourly:       # 1+ hours ago
+                    h = int((backup_diff.days * 24) + (backup_diff.seconds / 3600))
+                    interval = 'hours' if h != 1 else ' hour'
+                    print('%3d+ %s ago' % (h, interval))
+                case Mode.daily:        # 5 days ago
+                    d = int(backup_diff.days)
+                    interval = 'days' if d != 1 else 'day'
+                    print('%3d+ %s ago' % (d, interval))
+                case Mode.weekly:       # 5+ weeks ago
+                    w = int(backup_diff.days / 7)
+                    interval = 'weeks' if w != 1 else 'week'
+                    print('%3d+ %s ago' % (w, interval))
+                case Mode.monthly:      # 22+ weeks ago, 2023 02
+                    w = int(backup_diff.days / 7)
+                    interval = 'weeks' if w != 1 else 'week'
+                    print('%3d+ %s ago, %s %d' % (w, interval, backup_date.strftime('%B'), backup_date.year))
+                case _:                 # multi year difference, print default
+                    print(now - backup_date)
+
+    def run_realsizes(self, args):
+        # must be part of at least one backup source
+        conf = self.conf_or_err()
+        # load specific conf backup target or err
+        target = self.backup_target_or_err(conf, args.name)
+        # make sure that destination exists
+        self.marker_check(target)
+        # some output
+        if self.saf_verbose_level > 0:
+            print(f'List of backup sizes in {conf}, [{target.name.replace(".target", "")}] ==> {target.full_path}')
+            print('')
+        # just run magic command
+        if target.needs_ssh:
+            cmd_prefix = f'ssh -q {target.ssh_options} {target.ssh_server} '
+        else:
+            cmd_prefix = ''
+        cmd = cmd_prefix + f'du -h -d1 "{target.path}"'
+        self.safely_execute([cmd], output_on_screen=True)
+
+    def run_freespace(self, args):
+        # must be part of at least one backup source
+        conf = self.conf_or_err()
+        # load specific conf backup target or err
+        target = self.backup_target_or_err(conf, args.name)
+        # make sure that destination exists
+        self.marker_check(target)
+        # some output
+        if self.saf_verbose_level > 0:
+            print(f'Free space in {conf}, [{target.name.replace(".target", "")}] ==> {target.full_path}')
+            print('')
+        # just run magic command
+        if target.needs_ssh:
+            cmd_prefix = f'ssh -q {target.ssh_options} {target.ssh_server} '
+        else:
+            cmd_prefix = ''
+        cmd = cmd_prefix + f'df -h "{target.path}"'
+        self.safely_execute([cmd], output_on_screen=True)
+
+    def run_prune(self, args):
+        # must be part of at least one backup source
+        conf = self.conf_or_err()
+        # load specific conf backup target or err
+        target = self.backup_target_or_err(conf, args.name)
+        # make sure that destination exists
+        self.marker_check(target)
+        # some output
+        if self.saf_verbose_level > 0:
+            print(f'Prune in {conf}, [{target.name.replace(".target", "")}] ==> {target.full_path}')
+            print('')
+        # cutoff list [after, itemno]
+        now = datetime.now()
+        prune_criteria = []
+        prune_criteria.append(['hourly', now - timedelta(days = target.keep_hourly), 2])
+        prune_criteria.append(['daily', now - timedelta(days = target.keep_daily), 3])
+        prune_criteria.append(['weekly', now - timedelta(days = target.keep_weekly), 4])
+        prune_criteria.append(['monthly', now - timedelta(days = target.keep_monthly), 5])
+        prune_criteria.append(['yearly', now - timedelta(days = target.keep_yearly), -1])
+        # gather all backup folders, prepare expanded list
+        backup_list = self.get_backup_folders(target)
+        backup_list_full = []
+        for b in backup_list:
+            d = datetime.strptime(b, '%Y-%m-%d-%H%M%S')
+            b_record = dotdict({})
+            b_record.backup  = b
+            b_record.date    = d
+            b_record.b_day   = int(int(d.strftime("%s")) / 86400) # days since epoch
+            b_record.b_week  = d.isocalendar().week
+            b_record.b_month = d.month
+            b_record.b_year  = d.year
+            backup_list_full.append([b,
+                                     d,
+                                     int(int(d.strftime("%s")) / 86400), # days since epoch
+                                     d.isocalendar().week,
+                                     d.month,
+                                     d.year])
+        # create prune list
+        for idx in range(0, len(backup_list_full) - 1):
+            should_prune = None
+            for check in prune_criteria:
+                if backup_list_full[idx][1] < check[1]:
+                    if check[2] == -1 or backup_list_full[idx][check[2]] == backup_list_full[idx+1][check[2]]:
+                        should_prune = f'Because of {check[0]}, {check[2]}'
+                        break
+            if should_prune is not None:
+                if self.saf_verbose_level > 0:
+                    print(f'Prune {backup_list_full[idx][0]}')
+                # actually delete backup
+                if target.needs_ssh:
+                    cmd_prefix = f'ssh -q {target.ssh_options} {target.ssh_server} '
+                else:
+                    cmd_prefix = ''
+                cmd = cmd_prefix + f'rm -rf "{target.path}/{backup_list_full[idx][0]}"'
+                self.safely_execute([cmd])
+
+    def run_backup(self, args):
+        # backup always prunes first
+        self.run_prune(args)
+        # must be part of at least one backup source
+        conf = self.conf_or_err()
+        # load specific conf backup target or err
+        target = self.backup_target_or_err(conf, args.name)
+        # make sure that destination exists
+        self.marker_check(target)
+        # some output
+        if self.saf_verbose_level > 0:
+            print(f'Backup in {conf}, [{target.name.replace(".target", "")}] ==> {target.full_path}')
+            print('')
+        # resume?
+        if not args.resume:
+            if target.needs_ssh:
+                cmd_prefix = f'ssh -q {target.ssh_options} {target.ssh_server} '
+            else:
+                cmd_prefix = ''
+            cmd = cmd_prefix + f'rm -rf "{target.path}/in-progress"'
+            self.safely_execute([cmd])
+        # gather all needed to do actual backup
+        now = datetime.now()
+        finalfn = "%04d-%02d-%02d-%02d%02d%02d" % (now.year, now.month, now.day, now.hour, now.minute, now.second)
+        backup_list = self.get_backup_folders(target)
+        last_to_hardlink_with = None
+        if len(backup_list) > 0:
+            last_to_hardlink_with = Path(target.path + '/' + backup_list[-1])
+        # backup with temporary exclude file to in-progress
+        tmp = tempfile.NamedTemporaryFile(mode = 'w', delete=False)
+        try:
+            tmp.writelines([str(s) + '\n' for s in target.exclude])
+            tmp.close()
+            cmd = f'rsync {target.rsync_options}'
+            cmd += f' --exclude-from="{tmp.name}"'
+            if last_to_hardlink_with is not None:
+                cmd += f' --link-dest="{last_to_hardlink_with}"'
+            if target.needs_ssh:
+                cmd += f' -e "ssh {target.ssh_options}"'
+            cmd += f' -- "{target.source_location}/" "{target.full_path}/in-progress"'
+            if self.saf_verbose_level == 0:
+                self.safely_execute([cmd])
+            else:
+                self.safely_execute([cmd], output_on_screen = True)
+        finally:
+            os.unlink(tmp.name)
+        # finalize by renaming in-progress to actual backup name
+        if target.needs_ssh:
+            cmd_prefix = f'ssh -q {target.ssh_options} {target.ssh_server} '
+        else:
+            cmd_prefix = ''
+        cmd = cmd_prefix + f'mv "{target.path}/in-progress" "{target.path}/{finalfn}"'
+        self.safely_execute([cmd])
+
+    def run_rmrf(self, args):
+        # must be part of at least one backup source
+        conf = self.conf_or_err()
+        # load specific conf backup target or err
+        target = self.backup_target_or_err(conf, args.name)
+        # make sure that destination exists
+        self.marker_check(target)
+        # gather all needed to do actual rmrf
+        rmrf_path = Path(args.path).resolve().relative_to(Path(target.source_location))
+        backup_list = self.get_backup_folders(target)
+        # some output
+        if self.saf_verbose_level > 0:
+            print(f'Rmrf in {conf}, [{target.name.replace(".target", "")}] ==> {target.full_path}')
+            print(f'Removing {rmrf_path}')
+            print('')
+        # rmrf
+        for b in backup_list:
+            print(b)
+            if target.needs_ssh:
+                cmd_prefix = f'ssh -q {target.ssh_options} {target.ssh_server} '
+            else:
+                cmd_prefix = ''
+            cmd = cmd_prefix + f'rm -rf "{target.path}/{b}/{rmrf_path}"'
+            self.safely_execute([cmd])
+
+    def run_difference(self, args):
+        # must be part of at least one backup source
+        conf = self.conf_or_err()
+        # load specific conf backup target or err
+        target = self.backup_target_or_err(conf, args.name)
+        # make sure that destination exists
+        self.marker_check(target)
+        # gather all needed to do actual difference
+        backup_list = self.get_backup_folders(target)
+        if not args.backup in backup_list:
+            errquit(f'Backup {args.backup} does not exist')
+        if backup_list.index(args.backup) == 0:
+            errquit(f"Backup {args.backup} is the first one so we can't compare with previous")
+        compare_with = backup_list[backup_list.index(args.backup) - 1]
+        # some output
+        if self.saf_verbose_level > 0:
+            print(f'Difference in {conf}, [{target.name.replace(".target", "")}] ==> {target.full_path}')
+            print(f'Comparing {args.backup} with {compare_with} /* experimental */')
+            print("")
+        # compare
+        if target.needs_ssh:
+            cmd_prefix = f'ssh -q {target.ssh_options} {target.ssh_server} '
+        else:
+            cmd_prefix = ''
+        cmd = f'{cmd_prefix}rsync --dry-run -arvc '
+        cmd += f' -- "{target.path}/{args.backup}/" "{target.path}/{compare_with}"'
+        self.safely_execute([cmd], output_on_screen = True)
+
+if __name__ == "__main__":
+    backup = saf()
+    backup.process_command_line()
