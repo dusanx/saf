@@ -122,6 +122,29 @@ class saf:
             errquit('Not a saf backup source (or any of the parent directories): .saf.conf not found')
         return conf
 
+    def prune_sanity_check(self, target):
+        t = target.name.replace('.target', '')
+        # check minimal values that make sense
+        if target.keep_hourly < 1:
+            errquit(f'.saf.conf [{t}] error: keep-hourly must be at least 1 day')
+        if target.keep_daily < 1:
+            errquit(f'.saf.conf [{t}] error: keep-daily must be at least 1 day')
+        if target.keep_weekly < 7:
+            errquit(f'.saf.conf [{t}] error: keep-weekly must be at least 7 days')
+        if target.keep_monthly < 30:
+            errquit(f'.saf.conf [{t}] error: keep-monthly must be at least 30 days')
+        if target.keep_yearly < 365:
+            errquit(f'.saf.conf [{t}] error: keep-yearly must be at least 365 days')
+        # each next criteria must be at least one day longer than previous
+        if target.keep_daily <= target.keep_hourly:
+            errquit(f'.saf.conf [{t}] error: keep-daily must be at least one day longer than keep-hourly')
+        if target.keep_weekly <= target.keep_daily:
+            errquit(f'.saf.conf [{t}] error: keep-weekly must be at least one day longer than keep-daily')
+        if target.keep_monthly <= target.keep_weekly:
+            errquit(f'.saf.conf [{t}] error: keep-monthly must be at least one day longer than keep-weekly')
+        if target.keep_yearly <= target.keep_monthly:
+            errquit(f'.saf.conf [{t}] error: keep-yearly must be at least one day longer than keep-monthly')
+
     def backup_target_or_err(self, conf, want_target):
         c = configparser.ConfigParser(allow_no_value=True)
         c.read(str(conf))
@@ -159,6 +182,7 @@ class saf:
         target.keep_yearly = c[target_name].getint('keep-yearly', 3650)
         target.rsync_options = c[target_name].get('rsync-options', '')
         target.ssh_options = c[target_name].get('ssh-options', '')
+        self.prune_sanity_check(target)
         return target
 
     ##############
@@ -383,19 +407,8 @@ class saf:
         ed = os.getenv('EDITOR')
         if ed is None:
             errquit('Shell environment variable $EDITOR is not defined.')
-        # find first responsible or err
-        dir = Path.cwd().resolve()
-        found = False
-        while True:
-            conf = dir / '.saf.conf'
-            if conf.is_file():
-                found = True
-                break
-            if dir == Path('/'):
-                break
-            dir = dir.parent.resolve()
-        if not found:
-            errquit('Not a saf backup source (or any of the parent directories): .saf.conf not found')
+        # must be part of at least one backup source
+        conf = self.conf_or_err()
         # edit
         self.safely_execute([ed, str(conf)])
 
