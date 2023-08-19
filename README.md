@@ -14,7 +14,7 @@ Main backup code is used in production for many years and has proved its reliabi
 
 In **saf** every local file system directory can become backup source location. Each backup source location can have one or more backup target locations, in practice same directory (and its sub-directories) can be backed up to several target locations.
 
-Each backup source location (initialised by `saf init`) contains `.saf.conf` file, which is a simple and easy to change configuration file in Python configparser format. It is easy to query backup source locations down the directory tree with `saf status` or `saf status --all`, or up the directory tree with `saf status --reverse]`.
+Each backup source location (initialised by `saf init`) contains `.saf.conf` file, which is a simple and easy to change configuration file in Python configparser format. It is easy to query backup source locations down the directory tree with `saf status` or `saf status --all`, or up the directory tree with `saf status --reverse`.
 
 Each `.saf.conf` can contain one or more `[<name>.target]` sections, defining backup target locations. It is easy to add any number of different local or remote backup locations with `saf init --name <backup-name> <target-location>`, where `target-location` can be local directory `/mnt/backup-disk/backup-path` or remote storage/server `my-server:/mnt/backup-disk/backup-path`.
 
@@ -49,7 +49,7 @@ Initialize backup source and first local backup target (since we didn't specify 
 ```bash
 saf init /mnt/backup_ssd/saf-backup/home
 ```
-> **_NOTE:_**  Each **saf** command will require that backup.marker file exists at the destination and offer commands to create it if it is missing. This applies to any backup target, so **saf** can be sure that we can reach target location. In short just follow instructions when message appears.
+> **_NOTE:_**  Each **saf** command will require that `backup.marker` file exists at the destination and offer commands to create it if it is missing. This applies to any backup target, so **saf** can be sure that we can reach target location. In short just follow instructions when `backup.marker` related message appears.
 
 Check and modify `.saf.conf` responsible for current folder:
 ```bash
@@ -69,7 +69,7 @@ Add another target, this time over ssh on my-remote-server (specify target name 
 ```bash
 saf init --name my-vpn my-remote-server:/backup/saf-will-use-this/home
 ```
-Add another target, this time on my Hetzner Storage Box (change u000000 with actual Hetzner user ID):
+Add another target, this time on my Hetzner Storage Box (replace u000000 with actual Hetzner user ID):
 ```bash
 saf init --name H0 u000000@u000000.your-storagebox.de:/home/backup/saf-backup
 ```
@@ -94,7 +94,7 @@ Print **saf** version.
 
 ### saf init [-h] [--name NAME] target
 
-Initialize **saf** backup source at current folder and add first backup target.
+Initialize **saf** backup source at current folder and add first backup target or add backup target to already existing `.saf.conf`.
 
 ### saf status [-h] [--all | --reverse]
 
