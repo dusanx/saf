@@ -12,7 +12,7 @@
 
 "one backup is saf, two are safe, three are safer"
 
-> Current saf version is 0.16 | saf requires Python 3.10 or newer
+> Current saf version is 0.16, saf requires Python 3.10 or newer
 
 **saf** is a simple, reliable, rsync-based, battle tested, well rounded backup system, written in Python.
 
